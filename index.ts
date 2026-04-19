@@ -27,6 +27,9 @@ import {
 } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
+import { createConfidenceTracker } from "./src/confidence-tracker.js";
+import { createEntityGraph } from "./src/entity-graph.js";
+import { createProactiveInjector } from "./src/proactive-injector.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
@@ -250,6 +253,29 @@ interface PluginConfig {
      * // Entry without metadata.folder       → prefix: [W][preference:global]
      */
     categoryField?: string;
+  };
+
+  // ========================================================================
+  // New features: Confidence tracking, Entity graph, Proactive injection
+  // ========================================================================
+
+  /** Per-memory confidence tracking based on recall/useful signals. */
+  confidenceTracking?: {
+    enabled?: boolean;
+    decayFactor?: number;
+  };
+
+  /** Entity relationship extraction and graph. */
+  entityGraph?: {
+    enabled?: boolean;
+  };
+
+  /** Proactive memory injection alongside auto-recall. */
+  proactive?: {
+    enabled?: boolean;
+    staleMemoryDays?: number;
+    entityPrefetch?: boolean;
+    patternTriggers?: Record<string, string>;
   };
 }
 
@@ -1708,6 +1734,9 @@ interface PluginSingletonState {
   migrator: ReturnType<typeof createMigrator>;
   smartExtractor: SmartExtractor | null;
   extractionRateLimiter: ReturnType<typeof createExtractionRateLimiter>;
+  confidenceTracker: ReturnType<typeof createConfidenceTracker>;
+  entityGraph: ReturnType<typeof createEntityGraph>;
+  proactiveInjector: ReturnType<typeof createProactiveInjector>;
   // Session Maps — persist across scope refreshes instead of being recreated
   reflectionErrorStateBySession: Map<string, ReflectionErrorState>;
   reflectionDerivedBySession: Map<string, { updatedAt: number; derived: string[] }>;
@@ -1846,6 +1875,22 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     maxExtractionsPerHour: config.extractionThrottle?.maxExtractionsPerHour,
   });
 
+  // Confidence tracker (always created; no-op if disabled)
+  const confidenceTracker = createConfidenceTracker(
+    config.confidenceTracking ?? { enabled: true, decayFactor: 0.95 },
+  );
+
+  // Entity graph (disabled by default)
+  const entityGraph = createEntityGraph(
+    config.entityGraph ?? { enabled: false },
+  );
+
+  // Proactive injector (disabled by default)
+  const proactiveInjector = createProactiveInjector(
+    { retriever, entityGraph, scopeManager },
+    config.proactive ?? { enabled: false, staleMemoryDays: 7, entityPrefetch: true, patternTriggers: {} },
+  );
+
   // Session Maps — MUST be in singleton state so they persist across scope refreshes
   const reflectionErrorStateBySession = new Map<string, ReflectionErrorState>();
   const reflectionDerivedBySession = new Map<string, { updatedAt: number; derived: string[] }>();
@@ -1875,6 +1920,9 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     migrator,
     smartExtractor,
     extractionRateLimiter,
+    confidenceTracker,
+    entityGraph,
+    proactiveInjector,
     reflectionErrorStateBySession,
     reflectionDerivedBySession,
     reflectionByAgentCache,
@@ -1922,6 +1970,9 @@ const memoryLanceDBProPlugin = {
       decayEngine,
       tierManager,
       extractionRateLimiter,
+      confidenceTracker,
+      entityGraph,
+      proactiveInjector,
       reflectionErrorStateBySession,
       reflectionDerivedBySession,
       reflectionByAgentCache,
@@ -2238,10 +2289,12 @@ const memoryLanceDBProPlugin = {
         store,
         scopeManager,
         embedder,
-        agentId: undefined, // Will be determined at runtime from context
+        agentId: undefined,
         workspaceDir: getDefaultWorkspaceDir(),
         mdMirror,
         workspaceBoundary: config.workspaceBoundary,
+        entityGraph,
+        confidenceTracker,
       },
       {
         enableManagementTools: config.enableManagementTools,
